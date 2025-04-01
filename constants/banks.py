@@ -28,23 +28,31 @@ SBI = {
 # HDFC Bank patterns
 HDFC = {
     'name': 'HDFC Bank',
-    'header': r"(?i)Date.*Narration.*Chq\/Ref\.No.*Value\s+Dt.*Withdrawal\s+Amt.*Deposit\s+Amt.*Closing\s+Balance",
-    'transaction_pattern': r'''^\s*(\d{2}/\d{2}/\d{2})          # Transaction Date
-        \s+(.*?)                                     # Narration (non-greedy)
-        \s+(\S+)                                     # Chq./Ref.No.
-        \s+(\d{2}/\d{2}/\d{2})                        # Value Date
-        \s+([\d,]+\.\d{2})                           # Withdrawal Amount
-        \s+([\d,]+\.\d{2})                           # Deposit Amount
-        \s+([\d,]+\.\d{2})                           # Closing Balance
-        (?:\s+.*)?$''',
+    # Stricter regex focusing on mandatory spaces between keywords
+    'header': r"(?i)Date.*?Narration.*?Chq.*?Ref.*?No.*?Value.*?Dt.*?Withdrawal.*?Amt.*?Deposit.*?Amt.*?Closing.*?Balance",
+    'transaction_pattern': r'''^\s*
+        (\d{2}/\d{2}/\d{2})           # Date (Group 1)
+        \s+
+        (.*?)                         # Narration PART 1 (Group 2) - Non-greedy
+        \s+
+        (\S+)                         # Ref No (Group 3) - Assume it's the block before Value Date
+        \s+
+        (\d{2}/\d{2}/\d{2})           # Value Date (Group 4)
+        \s+
+        (.*?)                         # Everything BETWEEN Value Date and Closing Balance (Group 5)
+        \s+
+        ([\d,]+\.\d{2})                # Closing Balance (Group 6) - Anchor point!
+        \s*
+        (.*?)                         # Anything AFTER Closing Balance (Narration PART 2) (Group 7)
+    $''',
     'transaction_mapping': {
         'date': 1,
-        'narration': 2,
+        'narration_part1': 2, # Need to combine later
         'chq_ref_no': 3,
         'value_date': 4,
-        'withdrawal_amt': 5,
-        'deposit_amt': 6,
-        'closing_balance': 7
+        'amounts_text': 5,    # Raw text containing amounts
+        'closing_balance': 6,
+        'narration_part2': 7  # Need to combine later
     },
     'transaction_start_pattern': r"^\d{2}/\d{2}/\d{2}",
     'column_mapping': {
