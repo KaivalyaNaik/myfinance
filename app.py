@@ -1,123 +1,111 @@
-from flask import Flask, request, send_file, abort, render_template_string
-import tempfile
-from parser import parse_bank_statement
+import streamlit as st
+import pandas as pd
 import os
-app = Flask(__name__)
+from io import BytesIO
 
-@app.route('/')
-def index():
-    # Get list of supported banks from parser module
-    try:
-        from parser import BANKS
-        bank_options = "".join([f'<option value="{bank}">{config["name"]}</option>' for bank, config in BANKS.items()])
-    except ImportError:
-        bank_options = ""
-    
-    # Simple HTML form to upload a PDF file with bank selection
-    return render_template_string('''
-    <!doctype html>
-    <html>
-    <head>
-        <title>Bank Statement Parser</title>
-        <style>
-            body {
-                font-family: Arial, sans-serif;
-                max-width: 800px;
-                margin: 0 auto;
-                padding: 20px;
-            }
-            h1 {
-                color: #333;
-            }
-            form {
-                background-color: #f5f5f5;
-                padding: 20px;
-                border-radius: 5px;
-            }
-            label {
-                display: block;
-                margin: 10px 0 5px;
-                font-weight: bold;
-            }
-            input[type="file"], select {
-                margin-bottom: 15px;
-                width: 100%;
-                padding: 8px;
-            }
-            input[type="submit"] {
-                background-color: #4CAF50;
-                color: white;
-                padding: 10px 20px;
-                border: none;
-                border-radius: 4px;
-                cursor: pointer;
-            }
-            input[type="submit"]:hover {
-                background-color: #45a049;
-            }
-        </style>
-    </head>
-    <body>
-        <h1>Bank Statement Parser</h1>
-        <p>Upload your bank statement PDF to extract transactions into Excel format.</p>
-        <form method="post" enctype="multipart/form-data" action="/upload">
-            <label for="file">Select PDF Statement:</label>
-            <input type="file" name="file" id="file" accept=".pdf">
-            
-            <label for="bank">Select Bank (optional, auto-detected if not selected):</label>
-            <select name="bank" id="bank">
-                <option value="">Auto-detect</option>
-                {{ bank_options|safe }}
-            </select>
-            
-            <input type="submit" value="Upload and Parse">
-        </form>
-    </body>
-    </html>
-    ''', bank_options=bank_options)
+# Assuming parser.py is in the same directory or accessible in the Python path
+try:
+    from parser import parse_bank_statement
+except ImportError:
+    st.error("Failed to import 'parse_bank_statement' from parser.py. Make sure parser.py is in the correct location.")
+    # Add a dummy function to prevent NameError later if import fails
+    def parse_bank_statement(pdf_path):
+        st.error("Parser function not available.")
+        return None
 
-@app.route('/upload', methods=['POST'])
-def upload():    
-    if 'file' not in request.files:
-        return abort(400, "No file part in the request")
-    
-    file = request.files['file']
-    if file.filename == '':
-        return abort(400, "No file selected for uploading")
-    
-    # Get selected bank
-    bank_key = request.form.get('bank', '') or None
-    
+# --- Streamlit App UI ---
+
+st.set_page_config(layout="wide", page_title="Bank Statement Parser")
+
+st.title("Bank Statement Parser 📊")
+
+st.write("""
+Upload your bank statement PDF (HDFC, Union Bank supported for now)
+and get the transactions extracted into an Excel file.
+""")
+
+# --- File Upload ---
+uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+
+# --- Temporary File Handling and Parsing ---
+if uploaded_file is not None:
+    # To read the file content with pdftotext (used in parser.py),
+    # it needs to be saved temporarily to disk.
+    temp_dir = "temp_files"
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir)
+
+    temp_file_path = os.path.join(temp_dir, uploaded_file.name)
+
     try:
-        # Create temporary files
-        temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        file.save(temp_pdf.name)
-        
-        excel_file = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-        
-        # Call the new parse_bank_statement function
-        result = parse_bank_statement(
-            pdf_file=temp_pdf.name,
-            excel_output=excel_file.name,
-            bank_key=bank_key
-        )
-        
-        if result is None:
-            return abort(400, "Failed to parse the bank statement. Please check the PDF format.")
-        
-        return send_file(
-            excel_file.name, 
-            as_attachment=True, 
-            download_name="transactions.xlsx"
-        )
+        # Save the uploaded file bytes to the temporary file path
+        with open(temp_file_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        st.info(f"Processing '{uploaded_file.name}'...")
+
+        # --- Call the parser function ---
+        # CORRECTED ARGUMENT NAME HERE: pdf_path instead of pdf_file
+        parsed_df = parse_bank_statement(pdf_path=temp_file_path)
+        # ---
+
+        if parsed_df is not None and not parsed_df.empty:
+            st.success("Parsing successful!")
+            st.dataframe(parsed_df)
+
+            # --- Download Button ---
+            # Convert DataFrame to Excel in memory
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                parsed_df.to_excel(writer, index=False, sheet_name='Transactions')
+                # Optional: Adjust column widths
+                worksheet = writer.sheets['Transactions']
+                for idx, col in enumerate(parsed_df): # Loop through columns
+                    series = parsed_df[col]
+                    max_len = max((
+                        series.astype(str).map(len).max(), # Len of largest item
+                        len(str(series.name)) # Len of column name/header
+                    )) + 1 # Adding a little extra space
+                    worksheet.set_column(idx, idx, max_len) # Set column width
+
+            excel_data = output.getvalue()
+
+            # Prepare filename for download
+            base_filename = os.path.splitext(uploaded_file.name)[0]
+            download_filename = f"{base_filename}_transactions.xlsx"
+
+            st.download_button(
+                label="📥 Download Transactions as Excel",
+                data=excel_data,
+                file_name=download_filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+        elif parsed_df is not None and parsed_df.empty:
+            st.warning("Parsing completed, but no transactions were extracted. Check if the PDF format is supported or if the statement contains transactions.")
+        else:
+            # Error messages are printed by the parser function itself
+            st.error("Parsing failed. Check the console/logs for more details.")
+
     except Exception as e:
-        return abort(500, f"An error occurred: {str(e)}")
-    finally:
-        # Clean up temporary files
-        if 'temp_pdf' in locals() and os.path.exists(temp_pdf.name):
-            os.unlink(temp_pdf.name)
-        if 'excel_file' in locals() and os.path.exists(excel_file.name):
-            os.unlink(excel_file.name)
+        st.error(f"An unexpected error occurred: {e}")
+        import traceback
+        st.text(traceback.format_exc()) # Show detailed error in the app
 
-if __name__ == '__main__':
-    app.run(debug=True)
+    finally:
+        # --- Clean up the temporary file ---
+        if os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+                # print(f"Removed temporary file: {temp_file_path}") # Debugging print
+            except Exception as e:
+                st.warning(f"Could not remove temporary file {temp_file_path}: {e}")
+        # Optionally remove the temp directory if empty, but might be better to leave it
+        # if os.path.exists(temp_dir) and not os.listdir(temp_dir):
+        #     os.rmdir(temp_dir)
+
+else:
+    st.info("Upload a PDF file to begin.")
+
+# --- Footer or additional info ---
+st.markdown("---")
+st.markdown("Developed with Streamlit and Python.")

@@ -4,553 +4,533 @@ import pdftotext
 import re
 import pandas as pd
 import numpy as np
-import openpyxl
-# Removed unused imports: WordCloud, matplotlib, tempfile
+import openpyxl # Required by pandas ExcelWriter, ensure installed
 import os
 import importlib.util
 import sys
 import traceback # Added for debugging unexpected errors
 
-# Check if constants directory exists, if not create it
-constants_dir = os.path.join(os.path.dirname(__file__), 'constants')
-if not os.path.exists(constants_dir):
-    os.makedirs(constants_dir)
-    # Create __init__.py to make it a proper package
-    with open(os.path.join(constants_dir, '__init__.py'), 'w') as f:
-        pass
-
-# Create banks.py if it doesn't exist
-banks_file = os.path.join(constants_dir, 'banks.py')
-if not os.path.exists(banks_file):
-    with open(banks_file, 'w') as f:
-        f.write(r"""# Bank specific regex patterns
-
-# SBI Bank patterns
-SBI = {
-    'name': 'State Bank of India',
-    'header': r"(?i)S\.?\s*No.*Date.*Transaction\s+Id.*Remarks.*Amount.*Balance",
-    'balance': r"^([\d,]+\.\d+\s*\(\w+\))",
-    'transaction_pattern': r"^\s*(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(S\d+)\s+(.*?)\s+([\d,]+\.\d+\s*\(\w+\))\s+([\d,]+\.\d+\s*\(\w+\))(?:\s+.*)?$",
-    'transaction_mapping': {
-        'sr_no': 1,
-        'date': 2,
-        'transaction_id': 3,
-        'remarks': 4,
-        'amount': 5,
-        'balance': 6
-    },
-    'transaction_start_pattern': r"^\d+",
-    'column_mapping': {
-        'sr_no': 'S.No',
-        'date': 'Date',
-        'transaction_id': 'Transaction Id',
-        'remarks': 'Remarks',
-        'amount': 'Amount(Rs.)',
-        'balance': 'Balance'
-    }
-}
-
-# HDFC Bank patterns
-HDFC = {
-    'name': 'HDFC Bank',
-    # Stricter regex focusing on mandatory spaces between keywords and handling Chq./Ref.No.
-    'header': r"(?i)^\s*Date\s+Narration\s+Chq\.\s*\/\s*Ref\.\s*No\.?\s+Value\s+Dt\s+Withdrawal\s+Amt\s+Deposit\s+Amt\s+Closing\s+Balance",
-    'transaction_pattern': r'''^\s*(\d{2}/\d{2}/\d{2})          # Transaction Date
-        \s+(.*?)                                     # Narration (non-greedy)
-        \s+(\S+)                                     # Chq./Ref.No.
-        \s+(\d{2}/\d{2}/\d{2})                        # Value Date
-        \s+([\d,]+\.\d{2})                           # Withdrawal Amount
-        \s+([\d,]+\.\d{2})                           # Deposit Amount
-        \s+([\d,]+\.\d{2})                           # Closing Balance
-        (?:\s+.*)?$''',
-    'transaction_mapping': {
-        'date': 1,
-        'narration': 2,
-        'chq_ref_no': 3,
-        'value_date': 4,
-        'withdrawal_amt': 5,
-        'deposit_amt': 6,
-        'closing_balance': 7
-    },
-    'transaction_start_pattern': r"^\d{2}/\d{2}/\d{2}",
-    'column_mapping': {
-        'date': 'Date',
-        'narration': 'Narration',
-        'chq_ref_no': 'Chq/Ref.No.',
-        'value_date': 'Value Date',
-        'withdrawal_amt': 'Withdrawal Amt.',
-        'deposit_amt': 'Deposit Amt.',
-        'closing_balance': 'Closing Balance'
-    }
-}
-
-# Union Bank patterns
-UNION = {
-    'name': 'Union Bank of India',
-    'header': r"(?i)S\.?\s*No.*Date.*Transaction\s+Id.*Remarks.*Amount.*Balance",
-    'balance': r"^([\d,]+\.\d+\s*\(\w+\))",
-    'transaction_pattern': r"^\s*(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(S\d+)\s+(.*?)\s+([\d,]+\.\d+\s*\(\w+\))\s+([\d,]+\.\d+\s*\(\w+\))(?:\s+.*)?$",
-    'transaction_mapping': {
-        'sr_no': 1,
-        'date': 2,
-        'transaction_id': 3,
-        'remarks': 4,
-        'amount': 5,
-        'balance': 6
-    },
-    'transaction_start_pattern': r"^\d+",
-    'column_mapping': {
-        'sr_no': 'S.No',
-        'date': 'Date',
-        'transaction_id': 'Transaction Id',
-        'remarks': 'Remarks',
-        'amount': 'Amount(Rs.)',
-        'balance': 'Balance'
-    }
-}
-
-# Add more banks as needed
-
-# Dictionary of supported banks
-BANKS = {
-    'SBI': SBI,
-    'HDFC': HDFC,
-    'UNION': UNION
-}
-""")
-
-# Import the banks module
-try:
-    from constants.banks import BANKS
-except ImportError:
-    # Manual import if normal import fails
-    spec = importlib.util.spec_from_file_location("banks", banks_file)
-    banks_module = importlib.util.module_from_spec(spec)
-    sys.modules["banks"] = banks_module
-    spec.loader.exec_module(banks_module)
-    BANKS = banks_module.BANKS
+# --- Constants Loading ---
+# Dynamically load bank configurations from constants/banks.py
+constants_path = os.path.join(os.path.dirname(__file__), 'constants', 'banks.py')
+spec = importlib.util.spec_from_file_location("banks_config", constants_path)
+banks_config_module = importlib.util.module_from_spec(spec)
+sys.modules["banks_config"] = banks_config_module
+spec.loader.exec_module(banks_config_module)
+BANKS = banks_config_module.BANKS
+# --- End Constants Loading ---
 
 
 class BankStatementParser:
-    def __init__(self, bank_config=None):
-        self.bank_config = bank_config
+    """
+    Parses bank statements from PDF files for configured banks.
+    """
+    def __init__(self, pdf_path):
+        """
+        Initializes the parser with the path to the PDF file.
 
-    def detect_bank(self, page_text):
-        """Detect the bank based on the content of the page."""
-        for bank_key, bank_config in BANKS.items():
-            # Check for name first (more reliable if present)
-            if bank_config['name'].lower() in page_text.lower():
+        Args:
+            pdf_path (str): The file path to the PDF bank statement.
+        """
+        self.pdf_path = pdf_path
+        self.text = self._load_pdf()
+        self.bank_config = None
+        self.detected_bank = None
+
+    def _load_pdf(self):
+        """Loads text content from the PDF file."""
+        try:
+            with open(self.pdf_path, "rb") as f:
+                # Using layout preservation often helps with table structure
+                pdf = pdftotext.PDF(f, physical=True)
+            # Simple text cleaning: replace common ligature issues
+            raw_text = "\n".join(pdf)
+            cleaned_text = raw_text.replace('\uFB01', 'fi').replace('\uFB02', 'fl') # common ligatures
+            return cleaned_text
+        except Exception as e:
+            print(f"Error loading PDF {self.pdf_path}: {e}")
+            traceback.print_exc() # Print detailed traceback
+            return ""
+
+    def detect_bank(self):
+        """
+        Detects the bank based on keywords or patterns in the text.
+        Sets self.bank_config and self.detected_bank.
+        """
+        if not self.text:
+            print("PDF text is empty, cannot detect bank.")
+            return None
+
+        # Simple detection based on bank name first
+        for bank_key, config in BANKS.items():
+            if re.search(r'\b' + re.escape(config['name']) + r'\b', self.text, re.IGNORECASE):
+                self.detected_bank = bank_key
+                self.bank_config = config
+                print(f"Detected bank: {config['name']} ({bank_key})")
                 return bank_key
 
-        # Try to detect based on header pattern if name not found
-        for bank_key, bank_config in BANKS.items():
-            # Use find_header to check if the pattern matches anywhere
-            if self.find_header(page_text, config_override=bank_config):
-                 print(f"DEBUG: Detected bank '{bank_config['name']}' via header pattern during detection.")
-                 return bank_key
+        # Fallback: Try detecting based on header patterns if name not found
+        print("Bank name not found directly, attempting header pattern matching...")
+        lines = self.text.splitlines()
+        for bank_key, config in BANKS.items():
+             if 'header' in config:
+                 header_pattern = re.compile(config['header'], re.IGNORECASE)
+                 for i, line in enumerate(lines):
+                     line_cleaned = re.sub(r'\s+', ' ', line).strip() # Clean for header match
+                     if header_pattern.search(line_cleaned):
+                         start_pattern = config.get('transaction_start_pattern')
+                         if start_pattern:
+                             start_regex = re.compile(start_pattern)
+                             found_start = False
+                             for j in range(i + 1, min(i + 10, len(lines))):
+                                 # Match start pattern against original line structure
+                                 if start_regex.search(lines[j]):
+                                     found_start = True
+                                     break
+                             if found_start:
+                                 self.detected_bank = bank_key
+                                 self.bank_config = config
+                                 print(f"Detected bank via header/start pattern: {config['name']} ({bank_key})")
+                                 return bank_key
+                         else:
+                            self.detected_bank = bank_key
+                            self.bank_config = config
+                            print(f"Detected bank via header pattern: {config['name']} ({bank_key})")
+                            return bank_key
 
-        print("DEBUG: Bank detection failed based on name and header patterns.")
+        print("Could not detect a supported bank.")
+        self.detected_bank = None
+        self.bank_config = None
         return None
 
-    # Added config_override for use during detection phase
-    def find_header(self, page_text, config_override=None):
-        """Find the header row in the page text using the bank's header pattern."""
-        active_config = config_override if config_override else self.bank_config
 
-        if not active_config:
-            print("DEBUG: find_header called but no active_config.")
-            return None
-
-        header_pattern = active_config['header']
-
-        # --- START DEBUG ---
-        if not config_override: # Only print detailed debug when actually parsing, not detecting
-            print("-" * 20)
-            print("DEBUG: Attempting to find header...")
-            print(f"DEBUG: Using Bank: {active_config.get('name', 'Unknown')}")
-            print(f"DEBUG: Regex Pattern: {header_pattern}")
-            print("DEBUG: Searching within text (first ~500 chars):")
-            print(page_text[:500])
-            print("="*30)
-            print("DEBUG: Full text for header search:")
-            print(page_text) # Print the full text being searched
-            print("="*30)
-        # --- END DEBUG ---
-
-        # Search line by line for a more robust match
-        header_match_object = None
-        matched_line_text = None
-        for line in page_text.splitlines():
-            # Strip leading/trailing whitespace from line before matching
-            line_stripped = line.strip()
-            if not line_stripped: # Skip empty lines
-                continue
-            header_match_object = re.search(header_pattern, line_stripped)
-            if header_match_object:
-                matched_line_text = line_stripped # Store the line text that matched
-                break # Found it
-
-        # --- Debug search result ---
-        if header_match_object:
-             if not config_override: # Only print detailed debug when actually parsing
-                print(f"DEBUG: +++ Header FOUND using line-by-line search.")
-                print(f"DEBUG: Matched Line: '{matched_line_text}'") # Print the specific line
-                print(f"DEBUG: Matched Text: '{header_match_object.group(0)}'")
-                print("-" * 20)
-             return header_match_object.group(0) # Return the actual matched header text
-        else:
-             if not config_override: # Only print detailed debug when actually parsing
-                print("DEBUG: --- Header NOT FOUND using line-by-line search. ---")
-                print("-" * 20)
-             return None
-
-    def parse_transaction_line(self, transaction_line):
-        """Parse a transaction line based on the bank configuration."""
-        if not self.bank_config:
-            return None
-
-        pattern = self.bank_config['transaction_pattern']
-        mapping = self.bank_config['transaction_mapping']
-
-        # Use re.VERBOSE flag for HDFC pattern implicitly due to multiline string literal
-        match = re.match(pattern, transaction_line, re.VERBOSE if 'HDFC' in self.bank_config.get('name','') else 0)
-        if match:
-            result = {}
-            for field, group_index in mapping.items():
-                # Strip whitespace from extracted fields
-                result[field] = match.group(group_index).strip()
-            return result
-        else:
-            # Log lines that don't match the transaction pattern
-            # print(f"Warning: Could not parse transaction line starting with: '{transaction_line[:70]}...'")
-            return None
-
-    def parse_all_transactions(self, header_index, lines):
-        """Parse all transactions from the lines after the header, handling multi-line entries."""
-        if not self.bank_config:
-            return []
-
-        # Start from the line immediately after the header
-        transactions_lines_data = lines[header_index+1:]
-        transactions = []
-        current_transaction_lines = [] # Store lines for the current transaction
-
-        start_pattern = self.bank_config['transaction_start_pattern']
-
-        for line in transactions_lines_data:
-            line_stripped = line.strip()
-            if not line_stripped: # Skip empty lines
-                continue
-
-            # Check if line matches the start pattern
-            if re.match(start_pattern, line_stripped):
-                # If we have accumulated lines for a previous transaction, join and add them
-                if current_transaction_lines:
-                    transactions.append(" ".join(current_transaction_lines))
-
-                # Start a new transaction
-                current_transaction_lines = [line_stripped]
-            else:
-                # Append to the current transaction (handles multi-line remarks/narration)
-                # Only append if current_transaction_lines is not empty (avoid appending before first match)
-                if current_transaction_lines:
-                    current_transaction_lines.append(line_stripped)
-
-        # Add the last transaction found
-        if current_transaction_lines:
-            transactions.append(" ".join(current_transaction_lines))
-
-        return transactions
-
-    def parse_transactions(self, transactions_text_list):
-        """Parse a list of transaction lines (potentially multi-line joined) into a DataFrame."""
-        parsed_transactions = []
-        for transaction_text in transactions_text_list:
-            parsed = self.parse_transaction_line(transaction_text)
-            if parsed:
-                parsed_transactions.append(parsed)
-            else:
-                 # Log the transaction text that failed parsing for easier debugging
-                 print(f"Failed to parse transaction text block: '{transaction_text[:100]}...'")
-
-        if not parsed_transactions:
-             return pd.DataFrame() # Return empty DataFrame if nothing parsed
-
-        df = pd.DataFrame(parsed_transactions)
-
-        # --- START POST-PROCESSING for HDFC ---
-        # Check if this is HDFC based on expected columns from the mapping used in parse_transaction_line
-        if 'amounts_text' in df.columns and 'narration_part1' in df.columns:
-            print("DEBUG: Running HDFC post-processing...")
-
-            # --- 1. Combine Narration ---
-            df['narration'] = df['narration_part1'].str.strip() + ' ' + df['narration_part2'].str.strip()
-            df['narration'] = df['narration'].str.strip() # Clean up extra spaces
-
-            # --- 2. Prepare Numeric Balance ---
-            # Ensure closing_balance column exists before proceeding
-            if 'closing_balance' not in df.columns:
-                print("Error: 'closing_balance' column not found for HDFC post-processing.")
-                # Fallback or return df as is? Let's drop temp columns and return
-                df.drop(columns=['narration_part1', 'narration_part2', 'amounts_text'], inplace=True, errors='ignore')
-                return df
-
-            df['closing_balance_numeric'] = pd.to_numeric(
-                df['closing_balance'].str.replace(',', '', regex=False), errors='coerce'
-            )
-            # Handle potential conversion errors if any balance wasn't purely numeric
-            if df['closing_balance_numeric'].isnull().any():
-                 print("Warning: Could not convert all closing balances to numeric. Amount assignment might be affected.")
-
-            # --- 3. Calculate Balance Difference ---
-            # Ensure the DataFrame is sorted chronologically if possible (assuming it mostly is)
-            # HDFC statements are typically ordered correctly by pdftotext extraction
-            df['balance_diff'] = df['closing_balance_numeric'].diff()
-
-            # --- 4. Extract Amount Value ---
-            amount_pattern = re.compile(r'([\d,]+\.\d{2})')
-            # Apply search to the 'amounts_text' column
-            extracted_matches = df['amounts_text'].apply(lambda x: amount_pattern.search(str(x)))
-            # Store the extracted float amount temporarily
-            df['temp_amount_float'] = 0.0
-            for index, match in extracted_matches.items():
-                 if match:
-                     amount_str = match.group(1).replace(',', '')
-                     try:
-                         df.loc[index, 'temp_amount_float'] = float(amount_str)
-                     except ValueError:
-                          print(f"Warning: Could not convert extracted amount '{amount_str}' to float at index {index}")
-
-            # --- 5. Assign Amounts to Correct Columns ---
-            df['withdrawal_amt'] = 0.0
-            df['deposit_amt'] = 0.0
-
-            for index, row in df.iterrows():
-                amount = row['temp_amount_float']
-                diff = row['balance_diff']
-
-                if amount == 0.0: # Skip if no amount was extracted
-                    continue
-
-                # Handle the first row (diff is NaN) - Make an educated guess or default
-                if pd.isna(diff):
-                    # Simple Default: Assume first transaction is withdrawal if uncertain
-                    # A better approach might involve looking at an opening balance if available.
-                    print(f"DEBUG: First row (Index {index}), assigning amount {amount} to Withdrawal (default).")
-                    df.loc[index, 'withdrawal_amt'] = amount
-                    continue
-
-                # Check using numpy.isclose for floating point comparison
-                # Tolerance (atol) might need adjustment based on data precision
-                is_deposit = np.isclose(diff, amount, atol=0.01)
-                is_withdrawal = np.isclose(diff, -amount, atol=0.01)
-
-                if is_deposit:
-                    df.loc[index, 'deposit_amt'] = amount
-                elif is_withdrawal:
-                    df.loc[index, 'withdrawal_amt'] = amount
-                else:
-                    # Amount doesn't match balance change (e.g., fees, interest, complex transactions)
-                    print(f"Warning: Amount {amount} at index {index} doesn't match balance change {diff}. Assigning to Withdrawal (default).")
-                    # Default assignment, could be refined
-                    df.loc[index, 'withdrawal_amt'] = amount
-
-            # --- 6. Clean Up Temporary Columns ---
-            df.drop(columns=[
-                'narration_part1', 'narration_part2', 'amounts_text',
-                'closing_balance_numeric', 'balance_diff', 'temp_amount_float'
-                ], inplace=True, errors='ignore') # errors='ignore' in case a column wasn't created
-
-            # --- 7. Reorder columns for consistency (Optional but Recommended) ---
-            final_columns = []
-            original_mapping = self.bank_config.get('column_mapping', {})
-            # Get the desired HDFC column names from the original mapping values
-            desired_order = list(original_mapping.values())
-            # Ensure all essential columns are present, add if missing from desired_order
-            for col in ['date', 'narration', 'chq_ref_no', 'value_date', 'withdrawal_amt', 'deposit_amt', 'closing_balance']:
-                 if col in df.columns:
-                     final_columns.append(col)
-
-            # Add any extra columns that might exist but weren't in mapping
-            for col in df.columns:
-                if col not in final_columns:
-                    final_columns.append(col)
-            try:
-                 df = df[final_columns]
-            except KeyError as e:
-                 print(f"Warning: Could not reorder columns perfectly: {e}")
-
-
-        # --- END POST-PROCESSING ---
-
-        return df
-
-    # Modified parse_page to accept an expect_header flag
-    def parse_page(self, page_text, expect_header=True):
-        """Parse a single page of the bank statement."""
-        if not self.bank_config:
-            print("Error: Bank configuration not set for parsing page.")
-            return pd.DataFrame() # Return empty DataFrame on error
-
-        header_index = -1
-        lines = page_text.splitlines()
-        actual_header_text_on_page = None
-
-        # Find the header index robustly only if expected
-        if expect_header:
-            for i, line in enumerate(lines):
-                # Use find_header method which uses the regex on stripped lines
-                line_stripped = line.strip()
-                if not line_stripped: continue
-                header_match_text = self.find_header(line_stripped) # Pass stripped line
-                if header_match_text:
-                    header_index = i
-                    actual_header_text_on_page = line_stripped # Capture the line text
-                    print(f"DEBUG: Header index {header_index} found on page expected to have header.")
-                    print(f"DEBUG: Actual Header Text Matched on Page: '{actual_header_text_on_page}'")
-                    break
-            if header_index == -1:
-                print("DEBUG: Header NOT found on page where it was expected.")
-                # Treat as non-fatal, maybe transactions start without header on this specific page?
-                # Let's try parsing from the top anyway in this case.
-                header_index = -1 # Try parsing from start of page
-        else:
-            # If header is not expected, start parsing from the beginning (index -1 means start at lines[0])
-            print(f"DEBUG: Parsing all lines on subsequent page (header not expected).")
-            header_index = -1 # Effectively start from the top
-
-        transactions_data = self.parse_all_transactions(header_index, lines)
-        df = self.parse_transactions(transactions_data)
-
-        return df
-
-    def parse_pdf(self, pdf_file, excel_file=None):
-        """Parse a PDF bank statement and optionally save to Excel."""
+    def _clean_amount(self, amount_str):
+        """Removes commas and converts amount string to float."""
+        if isinstance(amount_str, (int, float)):
+            return float(amount_str)
+        if not isinstance(amount_str, str):
+            return np.nan
+        cleaned = re.sub(r"[^\d.]", "", amount_str.replace(',', ''))
         try:
-            with open(pdf_file, "rb") as file:
-                # Use default extraction mode (often equivalent to -layout)
-                pdf = pdftotext.PDF(file)
-                if not pdf:
-                    print("Error: Could not read PDF or PDF is empty.")
-                    return None
-                first_page_text = pdf[0]
+            return float(cleaned) if cleaned and cleaned != '.' else np.nan
+        except ValueError:
+            return np.nan
 
-                # --- Auto-detect bank if not specified ---
-                if not self.bank_config:
-                    bank_key = self.detect_bank(first_page_text) # Use detect_bank method
-                    if bank_key and bank_key in BANKS:
-                        self.bank_config = BANKS[bank_key]
-                        print(f"Detected bank: {self.bank_config['name']}")
-                    else:
-                        # Try page 2 for detection if available
-                        if len(pdf) > 1:
-                            bank_key = self.detect_bank(pdf[1])
-                            if bank_key and bank_key in BANKS:
-                                self.bank_config = BANKS[bank_key]
-                                print(f"Detected bank (on page 2): {self.bank_config['name']}")
 
-                        if not self.bank_config: # If still not detected
-                             print("Error: Could not detect bank from PDF content.")
-                             return None
+    def _parse_transactions(self):
+        """
+        Parses transaction data based on the detected bank's configuration.
+        Handles multi-line entries specifically for HDFC and Union Bank.
+        """
+        if not self.bank_config:
+            print("Bank configuration not set. Cannot parse transactions.")
+            return pd.DataFrame()
 
-                print(f"DEBUG: Using config for bank: {self.bank_config['name']}")
+        lines = self.text.splitlines()
+        transactions = []
+        in_transaction_section = False
+        header_found = False # Track if header was ever found
+        skipped_lines_count = 0 # Count lines skipped after header
 
-                # --- Find the definitive header location ---
-                header_text = self.find_header(pdf[0]) # Check page 1
-                header_page_index = 0
-                if not header_text:
-                     if len(pdf) > 1:
-                         print("DEBUG: Header not found on page 1, trying page 2...")
-                         header_text = self.find_header(pdf[1]) # Check page 2
-                         if header_text:
-                              header_page_index = 1
-                              print(f"DEBUG: Header found on Page {header_page_index + 1}.")
-                         else:
-                             print("Error: Header pattern not found in the first few pages.")
-                             return None # Fail if header isn't found early
-                     else:
-                          print("Error: Header pattern not found on the only page.")
-                          return None # Fail if header not found on single page PDF
+        # Compile necessary regex patterns from config
+        header_pattern = re.compile(self.bank_config['header'], re.IGNORECASE)
+        start_pattern_re = re.compile(self.bank_config.get('transaction_start_pattern', 'a^')) # Dummy if not present
+
+        # --- Bank-Specific Regex Compilation ---
+        if self.detected_bank == 'HDFC':
+            transaction_re = re.compile(self.bank_config['transaction_pattern'])
+            narration_cont_re = re.compile(self.bank_config.get('narration_continuation_pattern', 'a^'))
+        elif self.detected_bank == 'UNION_BANK':
+            txn_re_same_line = re.compile(self.bank_config['transaction_pattern_same_line'])
+            txn_re_multi_line = re.compile(self.bank_config['transaction_pattern_multi_line'])
+            multi_line_balance_re = re.compile(self.bank_config.get('multi_line_balance_pattern', 'a^'))
+            remarks_cont_re = re.compile(self.bank_config.get('remarks_continuation_pattern', 'a^'))
+        else:
+            transaction_re = re.compile(self.bank_config.get('transaction_pattern', 'a^'))
+
+
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            line_cleaned = re.sub(r'\s+', ' ', line).strip() # Cleaned version for header matching
+
+            # --- Header Detection ---
+            if not header_found and header_pattern.search(line_cleaned):
+                in_transaction_section = True
+                header_found = True
+                print(f"DEBUG: Found header on line {i}: '{line_cleaned}'")
+                i += 1
+                continue
+
+            if not in_transaction_section:
+                i += 1
+                continue
+
+            # --- Stop Conditions ---
+            if not line and transactions and i > 0 and not lines[i-1].strip():
+                 if all(not l.strip() for l in lines[i+1:min(i+4, len(lines))]):
+                     print(f"Stopping parse on encountering multiple blank lines (line {i}).")
+                     break
+
+            # REMOVED "Registered office:", REMOVED specific Closing Balance line pattern
+            stop_patterns = [
+                 r"Statement Summary", r"TOTAL DEBITS", # Keep TOTAL CREDITS?
+                 # r"NEFT:", r"RTGS:", r"UPI:", r"INT:", r"HBPS:", # These might appear in remarks
+                 r"This is system generated",
+                 r"Request to out customers", r"Transactions legend:",
+                 r"Minimum Balance", r"Average Monthly", r"Interest rate",
+                 r"If you have any queries", r"Please quote your",
+                 r"^\s*Generated On:",
+                 # Add pattern for HDFC end summary table start
+                 r"STATEMENT SUMMARY :-",
+                 # Add pattern for Union Bank end summary table start (if identifiable)
+                 # Example: r"^\s*Closing Balance\s*$", # A line just saying "Closing Balance"
+                 # Union bank specific end marker?
+                 r"^\s*Closing Balance\s+[\d,\.]+\s+Cr\s*$" # Match the final closing balance line
+            ]
+            should_stop = False
+            if transactions: # Only check stop patterns if we've started parsing
+                for pattern in stop_patterns:
+                    # Use original line for stop pattern matching as regex might be specific
+                    if re.search(pattern, line, re.IGNORECASE):
+                        should_stop = True
+                        print(f"Stopping parse on encountering footer/summary line {i}: '{line}'")
+                        break
+            if should_stop:
+                 break
+
+            # --- Transaction Matching ---
+            match_found = False
+            data = None
+            mapping = None
+            consumed_lines = 0
+
+            # --- HDFC Specific Logic ---
+            if self.detected_bank == 'HDFC':
+                # Use the ORIGINAL line for matching HDFC transactions now
+                match = transaction_re.match(line)
+                if match:
+                    skipped_lines_count = 0 # Reset skipped lines counter on match
+                    match_found = True
+                    data = list(match.groups())
+                    mapping = self.bank_config['transaction_mapping']
+                    narration_part1 = data[mapping['narration'] - 1]
+                    narration_parts = [narration_part1.strip()] if narration_part1 else []
+
+                    j = i + 1
+                    while j < len(lines):
+                        next_line = lines[j].strip()
+                        # Use original next_line for start pattern check
+                        if not next_line or start_pattern_re.search(lines[j]) or not narration_cont_re.match(next_line):
+                            break
+                        narration_parts.append(next_line)
+                        consumed_lines += 1
+                        j += 1
+                    full_narration = " ".join(narration_parts)
+                    data[mapping['narration'] - 1] = full_narration
                 else:
-                     print(f"DEBUG: Header found on Page {header_page_index + 1}.")
+                    # DEBUG: Print lines that don't match in HDFC section
+                    if line and start_pattern_re.search(line): # Only print if it looks like a txn start
+                        # print(f"DEBUG HDFC: No transaction match on line {i}: '{line}'") # Keep commented unless debugging HDFC
+                        skipped_lines_count += 1
 
 
-                # --- Parse pages starting from where header was found ---
-                result_df = pd.DataFrame()
-                header_found_on_this_page = True # Flag for the first page being processed
+            # --- Union Bank Specific Logic ---
+            elif self.detected_bank == 'UNION_BANK':
+                # Use the original line for matching Union Bank
+                match_same = txn_re_same_line.match(line)
+                if match_same:
+                    skipped_lines_count = 0
+                    match_found = True
+                    data = list(match_same.groups())
+                    mapping = self.bank_config['transaction_mapping_same_line']
+                    remarks_part1 = data[mapping['remarks'] - 1]
+                    remarks_parts = [remarks_part1.strip()] if remarks_part1 else []
+                    j = i + 1
+                    while j < len(lines):
+                        next_line = lines[j].strip()
+                        # Use original next_line for start pattern check
+                        if not next_line or start_pattern_re.search(lines[j]) or multi_line_balance_re.match(next_line) or not remarks_cont_re.match(next_line):
+                            break
+                        remarks_parts.append(next_line)
+                        consumed_lines += 1
+                        j += 1
+                    full_remarks = " ".join(part for part in remarks_parts if part)
+                    data[mapping['remarks'] - 1] = full_remarks
 
-                for i, page_text in enumerate(pdf):
-                    if i < header_page_index:
-                        continue # Skip pages before the header
+                else:
+                    match_multi = txn_re_multi_line.match(line)
+                    if match_multi:
+                        skipped_lines_count = 0
+                        match_found = True
+                        data = list(match_multi.groups())
+                        mapping = self.bank_config['transaction_mapping_multi_line']
+                        balance_value = None
+                        remarks_part1 = data[mapping['remarks'] - 1]
+                        remarks_parts = [remarks_part1.strip()] if remarks_part1 else []
 
-                    print(f"Processing page {i+1}...")
-                    # Pass the full page text and whether header should be sought
-                    df_page = self.parse_page(page_text, expect_header=header_found_on_this_page)
-                    header_found_on_this_page = False # Header only expected on the first page processed
+                        j = i + 1
+                        balance_found_on_next = False
+                        while j < len(lines):
+                            next_line = lines[j].strip()
+                            if not balance_found_on_next:
+                                balance_match = multi_line_balance_re.match(next_line)
+                                if balance_match:
+                                    balance_value = balance_match.group(1)
+                                    balance_found_on_next = True
+                                    consumed_lines += 1
+                                    j += 1
+                                    continue
+                            if remarks_cont_re.match(next_line):
+                                remarks_parts.append(next_line)
+                                consumed_lines += 1
+                                j += 1
+                            else: break
 
-                    if df_page is not None and not df_page.empty:
-                        result_df = pd.concat([result_df, df_page], ignore_index=True)
-
-                if result_df.empty:
-                    print("Warning: No transactions were parsed from the PDF.")
-                    # Consider if returning an empty DataFrame is better than None here
-                    return None # Indicate failure if no transactions parsed
-
-                # --- Rename columns and save ---
-                if 'column_mapping' in self.bank_config:
-                    try:
-                        result_df.rename(columns=self.bank_config['column_mapping'], inplace=True)
-                        print("DEBUG: Renamed columns based on mapping.")
-                    except Exception as rename_err:
-                        print(f"Warning: Error during column renaming: {rename_err}")
-
-
-                if excel_file:
-                    try:
-                        result_df.to_excel(excel_file, index=False)
-                        print(f"DEBUG: Successfully saved all parsed transactions to {excel_file}")
-                    except Exception as e:
-                        print(f"Error saving DataFrame to Excel: {e}")
-                        # Decide if failure to save should return None or the DataFrame
-                        return None # Return None if saving fails
-
-                return result_df
-
-        except pdftotext.Error as e:
-             print(f"pdftotext error: {e}")
-             return None
-        except FileNotFoundError:
-             print(f"Error: PDF file not found at {pdf_file}")
-             return None
-        except Exception as e:
-            print(f"An unexpected error occurred during PDF parsing: {e}")
-            traceback.print_exc() # Print full traceback for debugging
-            return None
+                        full_remarks = " ".join(part for part in remarks_parts if part)
+                        data[mapping['remarks'] - 1] = full_remarks
+                        balance_idx = list(mapping.keys()).index('balance')
+                        while len(data) <= balance_idx: data.append(None)
+                        data[balance_idx] = balance_value
+                    else:
+                        # *** DEBUG LINE IS ACTIVE FOR UNION BANK ***
+                        # Print lines that don't match either pattern in Union Bank section
+                        if line and start_pattern_re.search(line): # Only print if it looks like a txn start
+                            print(f"DEBUG UNION: No transaction match on line {i}: '{line}'")
+                            skipped_lines_count += 1
 
 
-def parse_bank_statement(pdf_file, excel_output=None, bank_key=None):
+            # --- Generic Bank Logic ---
+            else:
+                 if transaction_re.pattern != 'a^':
+                     match = transaction_re.match(line) # Use original line
+                     if match:
+                         skipped_lines_count = 0
+                         match_found = True
+                         data = list(match.groups())
+                         mapping = self.bank_config['transaction_mapping']
+
+
+            # --- Process Matched Data ---
+            if match_found and data and mapping:
+                current_transaction = {}
+                for col, map_index in mapping.items():
+                    target_col_name = self.bank_config['column_mapping'].get(col, col)
+                    value = None
+                    if map_index is not None: # Standard mapping
+                        if (map_index - 1) < len(data) and data[map_index - 1] is not None:
+                             value = data[map_index - 1]
+                    elif col == 'balance' and self.detected_bank == 'UNION_BANK': # Special multi-line
+                        balance_idx_in_map = list(mapping.keys()).index('balance')
+                        if balance_idx_in_map < len(data) and data[balance_idx_in_map] is not None:
+                             value = data[balance_idx_in_map]
+
+                    current_transaction[target_col_name] = value.strip() if isinstance(value, str) else value
+
+                transactions.append(current_transaction)
+                i += (1 + consumed_lines)
+                continue
+
+            # --- If no match, advance to next line ---
+            i += 1
+
+
+        # --- Post-Processing and DataFrame Creation ---
+        if not transactions:
+            if not header_found:
+                 print("Parsing Error: Header pattern never matched.")
+            else:
+                 print("No transactions found matching the pattern after the header.")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(transactions)
+
+        # --- Data Cleaning and Type Conversion ---
+        balance_col = None
+        date_col = None
+        final_balance_col_name = None # Store the final numeric balance column name
+
+        if self.detected_bank == 'HDFC':
+            balance_col_orig = self.bank_config['column_mapping']['balance']
+            date_col = self.bank_config['column_mapping']['date']
+            withdrawal_col = self.bank_config['column_mapping']['withdrawal']
+            deposit_col = self.bank_config['column_mapping']['deposit']
+
+            if withdrawal_col in df.columns: df[withdrawal_col] = df[withdrawal_col].apply(self._clean_amount)
+            if deposit_col in df.columns: df[deposit_col] = df[deposit_col].apply(self._clean_amount)
+            if balance_col_orig in df.columns:
+                final_balance_col_name = f'{balance_col_orig}_Num'
+                df[final_balance_col_name] = df[balance_col_orig].apply(self._clean_amount)
+
+            df['Amount_Num'] = df.apply(lambda row: row.get(withdrawal_col) if pd.notna(row.get(withdrawal_col)) and row.get(withdrawal_col) != 0 else row.get(deposit_col), axis=1)
+            df['Type'] = df.apply(lambda row: 'Dr' if pd.notna(row.get(withdrawal_col)) and row.get(withdrawal_col) != 0 else ('Cr' if pd.notna(row.get(deposit_col)) and row.get(deposit_col) != 0 else None), axis=1)
+            df['Amount(Rs.)'] = df.apply(lambda row: f"{row['Amount_Num']:.2f} ({row['Type']})" if pd.notna(row['Amount_Num']) and pd.notna(row['Type']) else None, axis=1)
+
+
+        elif self.detected_bank == 'UNION_BANK' or self.detected_bank == 'SBI':
+            amount_col = self.bank_config['column_mapping']['amount']
+            balance_col_orig = self.bank_config['column_mapping']['balance']
+            date_col = self.bank_config['column_mapping']['date']
+
+            def extract_amount_type(amount_str):
+                if not isinstance(amount_str, str): return None, None
+                val = self._clean_amount(amount_str)
+                type_ = 'Dr' if '(Dr)' in amount_str else ('Cr' if '(Cr)' in amount_str else None)
+                return val, type_
+
+            if amount_col in df.columns:
+                df[['Amount_Num', 'Type']] = df[amount_col].apply(lambda x: pd.Series(extract_amount_type(x)))
+            if balance_col_orig in df.columns:
+                final_balance_col_name = f'{balance_col_orig}_Num'
+                df[final_balance_col_name] = df[balance_col_orig].apply(self._clean_amount)
+
+
+        # Convert Date column
+        if date_col and date_col in df.columns:
+             date_format = '%d/%m/%y' if self.detected_bank == 'HDFC' else '%d/%m/%Y'
+             try:
+                 df[date_col] = pd.to_datetime(df[date_col], errors='coerce', format=date_format)
+             except Exception as e:
+                 print(f"Warning: Could not parse date column '{date_col}' with format {date_format}. Error: {e}")
+                 df[date_col] = pd.NaT
+
+        # Reorder columns
+        desired_cols = []
+        if date_col in df.columns: desired_cols.append(date_col)
+        core_keys = ['transaction_id', 'remarks', 'narration', 'ref_no', 'value_dt',
+                     'withdrawal', 'deposit', 'amount', 'balance']
+        for key in core_keys:
+            col_name = self.bank_config['column_mapping'].get(key)
+            if col_name and col_name in df.columns and col_name not in desired_cols:
+                desired_cols.append(col_name)
+
+        if 'Amount(Rs.)' in df.columns and 'Amount(Rs.)' not in desired_cols: desired_cols.append('Amount(Rs.)')
+        if final_balance_col_name and final_balance_col_name in df.columns: desired_cols.append(final_balance_col_name)
+        if 'Amount_Num' in df.columns: desired_cols.append('Amount_Num')
+        if 'Type' in df.columns: desired_cols.append('Type')
+
+        remaining_cols = [col for col in df.columns if col not in desired_cols]
+        final_cols = desired_cols + remaining_cols
+        final_cols = [col for col in final_cols if col in df.columns]
+
+        return df[final_cols]
+
+
+    def parse(self):
+        """
+        Detects the bank and parses the transactions.
+
+        Returns:
+            pandas.DataFrame: A DataFrame containing the parsed transactions,
+                              or an empty DataFrame if detection or parsing fails.
+        """
+        if not self.text:
+             print("PDF content is empty. Cannot parse.")
+             return pd.DataFrame()
+
+        if self.detect_bank():
+            try:
+                df = self._parse_transactions()
+                print(f"Successfully parsed {len(df)} transactions.")
+                # Add check for empty dataframe after parsing attempt
+                if df.empty and header_found:
+                     print("Warning: Header was found, but no transactions were successfully parsed.")
+                elif df.empty and not header_found:
+                     print("Warning: Header not found, and no transactions parsed.")
+
+                return df
+            except Exception as e:
+                print(f"An error occurred during parsing for {self.detected_bank}: {e}")
+                traceback.print_exc()
+                return pd.DataFrame()
+        else:
+            print("Bank detection failed. Cannot parse transactions.")
+            return pd.DataFrame()
+
+
+def parse_bank_statement(pdf_path):
     """
-    Parse a bank statement PDF and optionally save to Excel.
+    Convenience function to parse a bank statement PDF.
 
     Args:
-        pdf_file: Path to the bank statement PDF
-        excel_output: Optional path to save Excel output
-        bank_key: Optional key to specify the bank (SBI, HDFC, UNION, etc.)
+        pdf_path (str): Path to the PDF file.
 
     Returns:
-        DataFrame with parsed transactions, or None on failure.
+        pandas.DataFrame: Parsed transaction data, or empty DataFrame if parsing fails.
     """
-    bank_config = BANKS.get(bank_key) if bank_key else None
-    parser_instance = BankStatementParser(bank_config) # Renamed to avoid confusion with module
-    result = parser_instance.parse_pdf(pdf_file, excel_output)
-    # Return None explicitly if parsing failed or result is empty
-    return result if result is not None and not result.empty else None
+    if not os.path.exists(pdf_path):
+        print(f"Error: PDF file not found at {pdf_path}")
+        return pd.DataFrame() # Return empty DF
+
+    parser = BankStatementParser(pdf_path)
+    parsed_df = parser.parse()
+
+    if parsed_df is None: # Should not happen based on parse() logic, but check anyway
+        print(f"Parsing returned None unexpectedly for {pdf_path}")
+        return pd.DataFrame()
+    elif not parsed_df.empty:
+        # Clean column names only if DataFrame is not empty
+        cleaned_columns = {}
+        for col in parsed_df.columns:
+            new_col = str(col)
+            new_col = re.sub(r'[ /.\(\)]+', '_', new_col)
+            new_col = re.sub(r'_+', '_', new_col)
+            new_col = new_col.strip('_')
+            count = 1
+            original_new_col = new_col
+            while new_col in cleaned_columns.values():
+                new_col = f"{original_new_col}_{count}"
+                count += 1
+            cleaned_columns[col] = new_col
+        parsed_df.rename(columns=cleaned_columns, inplace=True)
+
+    return parsed_df # Return DataFrame (potentially empty)
 
 
-# Maintain backward compatibility
-def parser(file, excel_file):
-    """Legacy function for backward compatibility."""
-    print("Warning: Using legacy 'parser' function. Please use 'parse_bank_statement' instead.")
-    return parse_bank_statement(file, excel_file)
+# Example usage (for testing purposes)
+if __name__ == '__main__':
+    # --- Test with Union Bank PDF ---
+    test_pdf_path_union = 'union_unlocked.pdf'
+    if os.path.exists(test_pdf_path_union):
+        print(f"\n--- Testing Parser with {test_pdf_path_union} ---")
+        df_result_union = parse_bank_statement(test_pdf_path_union)
+        if df_result_union is not None and not df_result_union.empty:
+            print("\n--- Union Bank Parsing Successful ---")
+            print(f"Number of transactions parsed: {len(df_result_union)}")
+            # print("\nFirst 5 rows:") # Keep output concise for debugging
+            # print(df_result_union.head())
+            # print("\nLast 5 rows:")
+            # print(df_result_union.tail())
+            output_filename_union = "parsed_union_bank_test_output.xlsx"
+            try:
+                df_result_union.to_excel(output_filename_union, index=False)
+                print(f"\nSaved parsed data to {output_filename_union}")
+            except Exception as e:
+                 print(f"\nError saving Union Bank results to Excel: {e}")
+        else:
+            print("\n--- Union Bank Parsing Failed or No Data ---")
+    else:
+        print(f"\nTest PDF not found at '{test_pdf_path_union}'. Skipping Union Bank test run.")
+
+    # --- Test with HDFC PDF ---
+    test_pdf_path_hdfc = 'march.pdf'
+    if os.path.exists(test_pdf_path_hdfc):
+        print(f"\n--- Testing Parser with {test_pdf_path_hdfc} ---")
+        df_result_hdfc = parse_bank_statement(test_pdf_path_hdfc)
+        if df_result_hdfc is not None and not df_result_hdfc.empty:
+             print("\n--- HDFC Parsing Successful ---")
+             print(f"Number of transactions parsed: {len(df_result_hdfc)}")
+             # print("\nFirst 5 rows:") # Keep output concise for debugging
+             # print(df_result_hdfc.head())
+             output_filename_hdfc = "parsed_hdfc_test_output.xlsx"
+             try:
+                 df_result_hdfc.to_excel(output_filename_hdfc, index=False)
+                 print(f"\nSaved parsed data to {output_filename_hdfc}")
+             except Exception as e:
+                 print(f"\nError saving HDFC results to Excel: {e}")
+        else:
+             print("\n--- HDFC Parsing Failed or No Data ---")
+    else:
+        print(f"\nTest PDF not found at '{test_pdf_path_hdfc}'. Skipping HDFC test run.")
 
 # --- END OF FILE parser.py ---
