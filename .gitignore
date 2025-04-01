@@ -1,2 +1,4 @@
 .qodo
 __pycache__/*
+*.pyc
+parsed_*.xlsx
